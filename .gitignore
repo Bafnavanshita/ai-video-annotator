@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+env/
+
+# Videos
+*.mp4
+*.avi
+
+# Test data
+test_videos/
+*.json
+
+# System files
+.DS_Store
+Thumbs.db
+*.log 
