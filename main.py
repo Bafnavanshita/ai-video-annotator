@@ -4,18 +4,22 @@ import cv2
 import numpy as np
 import os
 import tempfile
-from typing import Dict, List, Optional
+from typing import Dict, Tuple
 import uvicorn
 import mediapipe as mp
 from scipy.spatial import distance as dist
+from collections import deque
+import warnings
+
+os.environ['OPENCV_VIDEOIO_PRIORITY_MSMF'] = '0'
+warnings.filterwarnings('ignore')
 
 app = FastAPI(
     title="AI Video Annotator Service",
-    description="Automated video annotation for eye state and posture detection",
-    version="1.0.0"
+    description="Video annotation for eye state and posture detection",
+    version="13.0.0"
 )
 
-# Initialize MediaPipe Face Mesh
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
     static_image_mode=False,
@@ -25,327 +29,183 @@ face_mesh = mp_face_mesh.FaceMesh(
     min_tracking_confidence=0.5
 )
 
-print("MediaPipe Face Mesh initialized")
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(
+    static_image_mode=False,
+    model_complexity=2,
+    smooth_landmarks=True,
+    enable_segmentation=False,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
 
-# MediaPipe eye landmarks (6 points per eye for EAR calculation)
 LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
 
-# OpenCV Haar Cascade (backup method)
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+EYE_AR_THRESHOLD = 0.18
 
 
-def calculate_ear(eye_landmarks):
-    """
-    Calculate Eye Aspect Ratio (EAR) - proven method for eye state detection.
-    EAR = (||p2-p6|| + ||p3-p5||) / (2 * ||p1-p4||)
-    """
-    # Vertical distances
+def calculate_ear(eye_landmarks) -> float:
     A = dist.euclidean(eye_landmarks[1], eye_landmarks[5])
     B = dist.euclidean(eye_landmarks[2], eye_landmarks[4])
-    
-    # Horizontal distance
     C = dist.euclidean(eye_landmarks[0], eye_landmarks[3])
     
-    if C > 0:
-        ear = (A + B) / (2.0 * C)
-    else:
-        ear = 0.25  # Default to open
+    if C < 0.001:
+        return 0.25
     
-    return ear
+    return (A + B) / (2.0 * C)
 
 
-def weighted_majority(buffer: List[str], weights: Optional[List[float]] = None) -> str:
-    """
-    Weighted voting for temporal smoothing - recent frames have higher weight.
-    """
-    if not buffer:
-        return "Open"  # Default
+def calculate_angle_3d(p1: Tuple[float, float, float], 
+                       p2: Tuple[float, float, float], 
+                       p3: Tuple[float, float, float]) -> float:
+    v1 = np.array([p1[0] - p2[0], p1[1] - p2[1], p1[2] - p2[2]])
+    v2 = np.array([p3[0] - p2[0], p3[1] - p2[1], p3[2] - p2[2]])
     
-    if weights is None:
-        # Default weights: recent frames matter more
-        weights = [0.5, 0.7, 0.9, 1.0, 1.2, 1.4, 1.6]
+    cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
+    cos_angle = np.clip(cos_angle, -1.0, 1.0)
     
-    weighted_votes = {}
-    for i, value in enumerate(buffer):
-        weight = weights[min(i, len(weights) - 1)]
-        weighted_votes[value] = weighted_votes.get(value, 0) + weight
-    
-    return max(weighted_votes, key=weighted_votes.get)
+    return np.degrees(np.arccos(cos_angle))
 
 
-def detect_eye_state_advanced(frame, frame_brightness: float = None) -> tuple:
-    """
-    Advanced eye detection using MediaPipe + OpenCV ensemble.
-    Multi-method approach for robustness.
-    
-    Returns: (eye_state: str, confidence: float)
-    """
+def detect_eye_state(frame) -> Tuple[str, float]:
     h, w = frame.shape[:2]
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(frame_rgb)
     
-    # Calculate frame brightness for adaptive thresholding
-    if frame_brightness is None:
-        frame_brightness = np.mean(gray)
+    if not results.multi_face_landmarks:
+        return "Open", 0.0
     
-    eye_scores = []
-    confidences = []
+    face_landmarks = results.multi_face_landmarks[0]
     
-    # Method 1: MediaPipe Face Mesh (PRIMARY - Most Accurate)
-    try:
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = face_mesh.process(frame_rgb)
-        
-        if results.multi_face_landmarks:
-            face_landmarks = results.multi_face_landmarks[0]
-            
-            # Check landmark visibility/confidence
-            nose_tip = face_landmarks.landmark[1]
-            if nose_tip.visibility > 0.5 if hasattr(nose_tip, 'visibility') else True:
-                # Extract left eye landmarks
-                left_eye = [(face_landmarks.landmark[i].x * w, face_landmarks.landmark[i].y * h) 
-                           for i in LEFT_EYE_INDICES]
-                
-                # Extract right eye landmarks
-                right_eye = [(face_landmarks.landmark[i].x * w, face_landmarks.landmark[i].y * h) 
-                            for i in RIGHT_EYE_INDICES]
-                
-                # Calculate EAR for both eyes
-                left_ear = calculate_ear(left_eye)
-                right_ear = calculate_ear(right_eye)
-                avg_ear = (left_ear + right_ear) / 2.0
-                
-                eye_scores.append(avg_ear)
-                confidences.append(0.9)  # High confidence for MediaPipe
-    except Exception as e:
-        pass
+    left_eye_points = [(face_landmarks.landmark[i].x * w, face_landmarks.landmark[i].y * h) 
+                       for i in LEFT_EYE_INDICES]
+    right_eye_points = [(face_landmarks.landmark[i].x * w, face_landmarks.landmark[i].y * h) 
+                        for i in RIGHT_EYE_INDICES]
     
-    # Method 2: OpenCV Haar Cascade (BACKUP)
-    try:
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-        
-        if len(faces) > 0:
-            # Use largest face
-            face = max(faces, key=lambda f: f[2] * f[3])
-            (x, y, fw, fh) = face
-            roi_gray = gray[y:y+fh, x:x+fw]
-            
-            # Eye region (top 20-60% of face)
-            eye_region = roi_gray[int(fh*0.2):int(fh*0.6), :]
-            
-            # Detect eyes
-            eyes = eye_cascade.detectMultiScale(eye_region, scaleFactor=1.1, minNeighbors=3, minSize=(20, 20))
-            
-            # Adaptive brightness threshold
-            adaptive_threshold = max(30, frame_brightness * 0.3)
-            
-            if len(eyes) >= 2:
-                # Both eyes detected = definitely open
-                eye_scores.append(0.28)
-                confidences.append(0.7)
-            elif len(eyes) == 1:
-                # One eye - check brightness with adaptive threshold
-                ex, ey, ew, eh = eyes[0]
-                eye_patch = eye_region[ey:ey+eh, ex:ex+ew]
-                if eye_patch.size > 0:
-                    brightness = np.mean(eye_patch)
-                    variance = np.var(eye_patch)
-                    # Bright and high variance = open (adaptive threshold)
-                    if variance > 200 and brightness > adaptive_threshold:
-                        eye_scores.append(0.26)
-                        confidences.append(0.6)
-                    else:
-                        eye_scores.append(0.18)
-                        confidences.append(0.5)
-            else:
-                # No eyes detected - check region characteristics
-                if eye_region.size > 0:
-                    brightness = np.mean(eye_region)
-                    variance = np.var(eye_region)
-                    # Dark and low variance = closed
-                    if brightness < adaptive_threshold and variance < 180:
-                        eye_scores.append(0.16)
-                        confidences.append(0.4)
-                    else:
-                        eye_scores.append(0.22)
-                        confidences.append(0.4)
-    except Exception as e:
-        pass
+    left_ear = calculate_ear(left_eye_points)
+    right_ear = calculate_ear(right_eye_points)
+    avg_ear = (left_ear + right_ear) / 2.0
     
-    # Decision fusion with confidence weighting
-    if len(eye_scores) == 0:
-        return "Open", 0.3  # Low confidence default
+    threshold_low = 0.16
+    threshold_high = 0.20
     
-    # Weighted average by confidence
-    if len(confidences) == len(eye_scores):
-        avg_ear = np.average(eye_scores, weights=confidences)
-        avg_confidence = np.mean(confidences)
+    if avg_ear < threshold_low:
+        return "Closed", 0.92
+    elif avg_ear < threshold_high:
+        return "Closed", 0.75
     else:
-        avg_ear = np.mean(eye_scores)
-        avg_confidence = 0.6
+        return "Open", 0.92
+
+
+def detect_posture(frame) -> Tuple[str, float]:
+    h, w = frame.shape[:2]
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     
-    # IMPROVED: Wider threshold gap for better separation
-    CLOSED_THRESHOLD = 0.18  # Lowered from 0.20
-    OPEN_THRESHOLD = 0.25    # Raised from 0.23
+    pose_results = pose.process(frame_rgb)
     
-    if avg_ear < CLOSED_THRESHOLD:
-        return "Closed", avg_confidence
-    elif avg_ear > OPEN_THRESHOLD:
-        return "Open", avg_confidence
-    else:
-        # Ambiguous zone - use confidence-weighted decision
-        midpoint = (CLOSED_THRESHOLD + OPEN_THRESHOLD) / 2
-        if avg_ear >= midpoint:
-            return "Open", avg_confidence * 0.8
+    if not pose_results.pose_landmarks:
+        return "Hunched", 0.0
+    
+    landmarks = pose_results.pose_landmarks.landmark
+    
+    try:
+        left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
+        right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
+        left_hip = landmarks[mp_pose.PoseLandmark.LEFT_HIP]
+        right_hip = landmarks[mp_pose.PoseLandmark.RIGHT_HIP]
+        left_ear = landmarks[mp_pose.PoseLandmark.LEFT_EAR]
+        right_ear = landmarks[mp_pose.PoseLandmark.RIGHT_EAR]
+        
+        visibility_threshold = 0.3
+        if not all([
+            left_shoulder.visibility > visibility_threshold,
+            right_shoulder.visibility > visibility_threshold,
+            left_hip.visibility > visibility_threshold,
+            right_hip.visibility > visibility_threshold
+        ]):
+            return "Hunched", 0.0
+        
+        shoulder_mid = (
+            (left_shoulder.x + right_shoulder.x) / 2,
+            (left_shoulder.y + right_shoulder.y) / 2,
+            (left_shoulder.z + right_shoulder.z) / 2
+        )
+        
+        hip_mid = (
+            (left_hip.x + right_hip.x) / 2,
+            (left_hip.y + right_hip.y) / 2,
+            (left_hip.z + right_hip.z) / 2
+        )
+        
+        ear_mid = (
+            (left_ear.x + right_ear.x) / 2,
+            (left_ear.y + right_ear.y) / 2,
+            (left_ear.z + right_ear.z) / 2
+        )
+        
+        torso_vector = np.array([
+            shoulder_mid[0] - hip_mid[0],
+            shoulder_mid[1] - hip_mid[1],
+            shoulder_mid[2] - hip_mid[2]
+        ])
+        
+        torso_length = np.linalg.norm(torso_vector)
+        
+        if torso_length < 0.05:
+            return "Hunched", 0.0
+        
+        vertical_distance = shoulder_mid[1] - ear_mid[1]
+        normalized_vertical = vertical_distance / torso_length
+        
+        neck_angle = calculate_angle_3d(ear_mid, shoulder_mid, hip_mid)
+        
+        shoulder_forward = shoulder_mid[2] - hip_mid[2]
+        normalized_shoulder_forward = shoulder_forward / torso_length
+        
+        ear_forward = ear_mid[2] - shoulder_mid[2]
+        normalized_ear_forward = ear_forward / torso_length
+        
+        is_head_high = normalized_vertical > 0.80
+        is_neck_straight = neck_angle > 165
+        is_body_upright = normalized_shoulder_forward < 0.12
+        is_head_back = normalized_ear_forward < 0.10
+        
+        straight_score = sum([is_head_high, is_neck_straight, is_body_upright, is_head_back])
+        
+        if straight_score >= 3:
+            return "Straight", 0.89
         else:
-            return "Closed", avg_confidence * 0.8
+            return "Hunched", 0.89
+            
+    except Exception:
+        return "Hunched", 0.0
 
 
-def detect_posture_advanced(frame) -> tuple:
-    """
-    Advanced posture detection using MediaPipe + OpenCV multi-factor analysis.
-    Ensemble scoring from multiple geometric features.
+class TemporalSmoother:
+    def __init__(self, posture_buffer_size=11):
+        self.posture_buffer_size = posture_buffer_size
+        self.posture_buffer = deque(maxlen=posture_buffer_size)
     
-    Returns: (posture: str, confidence: float)
-    """
-    h, w = frame.shape[:2]
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    def add_posture(self, posture):
+        self.posture_buffer.append(posture)
     
-    posture_votes = []
-    confidences = []
-    
-    # Method 1: MediaPipe Face Mesh (PRIMARY)
-    try:
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = face_mesh.process(frame_rgb)
+    def get_smoothed_posture(self) -> str:
+        if not self.posture_buffer:
+            return "Hunched"
         
-        if results.multi_face_landmarks:
-            face_landmarks = results.multi_face_landmarks[0]
-            
-            # Key facial points
-            nose_tip = face_landmarks.landmark[1]
-            forehead = face_landmarks.landmark[10]
-            chin = face_landmarks.landmark[152]
-            
-            # Convert to pixel coordinates
-            nose_y = nose_tip.y * h
-            forehead_y = forehead.y * h
-            chin_y = chin.y * h
-            
-            # Calculate metrics
-            face_height = abs(chin_y - forehead_y)
-            relative_nose_y = nose_y / h
-            face_span_ratio = face_height / h
-            
-            # Multi-factor scoring (IMPROVED: Higher threshold)
-            score = 0
-            
-            # Factor 1: Vertical position (lower = hunched)
-            if relative_nose_y > 0.65:
-                score += 5
-            elif relative_nose_y > 0.58:
-                score += 3
-            elif relative_nose_y > 0.52:
-                score += 1
-            
-            # Factor 2: Face size (smaller = farther/hunched)
-            if face_span_ratio < 0.25:
-                score += 5
-            elif face_span_ratio < 0.32:
-                score += 3
-            elif face_span_ratio < 0.40:
-                score += 1
-            
-            # Factor 3: Overall face span
-            all_y_coords = [lm.y * h for lm in face_landmarks.landmark]
-            total_span = (max(all_y_coords) - min(all_y_coords)) / h
-            
-            if total_span < 0.28:
-                score += 3
-            elif total_span < 0.36:
-                score += 1
-            
-            # Factor 4: Face width analysis
-            all_x_coords = [lm.x * w for lm in face_landmarks.landmark]
-            face_width = (max(all_x_coords) - min(all_x_coords)) / w
-            
-            if face_width < 0.15:
-                score += 2
-            elif face_width < 0.20:
-                score += 1
-            
-            # IMPROVED: Raised threshold from 6 to 8
-            posture_votes.append("Hunched" if score >= 8 else "Straight")
-            confidences.append(0.9)
-    except Exception as e:
-        pass
-    
-    # Method 2: OpenCV Haar Cascade (BACKUP)
-    try:
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+        if len(self.posture_buffer) < 3:
+            return self.posture_buffer[-1]
         
-        if len(faces) > 0:
-            face = max(faces, key=lambda f: f[2] * f[3])
-            (x, y, fw, fh) = face
-            
-            # Calculate metrics
-            face_center_y = (y + fh/2) / h
-            face_area_ratio = (fw * fh) / (w * h)
-            aspect_ratio = fh / fw if fw > 0 else 1.0
-            width_ratio = fw / w
-            
-            score = 0
-            
-            # Vertical position
-            if face_center_y > 0.60:
-                score += 4
-            elif face_center_y > 0.52:
-                score += 2
-            
-            # Face size
-            if face_area_ratio < 0.07:
-                score += 4
-            elif face_area_ratio < 0.11:
-                score += 2
-            elif face_area_ratio < 0.15:
-                score += 1
-            
-            # Aspect ratio (wider than tall = hunched)
-            if aspect_ratio < 1.15:
-                score += 3
-            elif aspect_ratio < 1.25:
-                score += 1
-            
-            # Width
-            if width_ratio < 0.18:
-                score += 1
-            
-            # IMPROVED: Raised threshold from 5 to 7
-            posture_votes.append("Hunched" if score >= 7 else "Straight")
-            confidences.append(0.7)
-    except Exception as e:
-        pass
-    
-    # Ensemble decision with confidence
-    if len(posture_votes) == 0:
-        return "Straight", 0.3  # Low confidence default
-    
-    # Confidence-weighted voting
-    weighted_votes = {}
-    for vote, conf in zip(posture_votes, confidences):
-        weighted_votes[vote] = weighted_votes.get(vote, 0) + conf
-    
-    result = max(weighted_votes, key=weighted_votes.get)
-    avg_confidence = np.mean(confidences)
-    
-    return result, avg_confidence
+        votes = {"Straight": 0, "Hunched": 0}
+        for i, state in enumerate(self.posture_buffer):
+            weight = (i + 1) ** 1.3
+            votes[state] += weight
+        
+        return max(votes, key=votes.get)
 
 
 def process_video(video_path: str) -> Dict:
-    """
-    Process video with advanced hybrid detection and improved temporal smoothing.
-    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise Exception("Could not open video file")
@@ -354,25 +214,14 @@ def process_video(video_path: str) -> Dict:
     fps = cap.get(cv2.CAP_PROP_FPS)
     labels_per_frame = {}
     
-    print(f"\n{'='*60}")
-    print(f"Video: {os.path.basename(video_path)}")
-    print(f"Frames: {total_frames} @ {fps:.1f} FPS")
-    print(f"AI Models: MediaPipe Face Mesh + OpenCV")
-    print(f"{'='*60}\n")
+    print(f"\nProcessing: {os.path.basename(video_path)}")
+    print(f"Total frames: {total_frames} at {fps:.1f} FPS\n")
     
-    # Temporal smoothing buffers with improved weighting
-    eye_buffer = []
-    posture_buffer = []
-    BUFFER_SIZE = 7  # Larger buffer for more stability
-    
-    # Weights for temporal smoothing (recent frames have more influence)
-    temporal_weights = [0.5, 0.7, 0.9, 1.0, 1.2, 1.4, 1.6]
+    smoother = TemporalSmoother(posture_buffer_size=11)
     
     frame_idx = 0
-    prev_label = {"eye_state": "Open", "posture": "Straight"}
-    
-    # Calculate global frame brightness for adaptive processing
-    frame_brightnesses = []
+    last_valid_eye = "Open"
+    last_valid_posture = "Hunched"
     
     while True:
         ret, frame = cap.read()
@@ -380,55 +229,43 @@ def process_video(video_path: str) -> Dict:
             break
         
         try:
-            # Calculate frame brightness
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            frame_brightness = np.mean(gray)
-            frame_brightnesses.append(frame_brightness)
+            eye_state, eye_conf = detect_eye_state(frame)
+            posture, posture_conf = detect_posture(frame)
             
-            # Use average brightness for adaptive thresholding
-            avg_brightness = np.mean(frame_brightnesses[-30:])  # Last 1 second
+            if eye_conf < 0.3:
+                eye_state = last_valid_eye
+            else:
+                last_valid_eye = eye_state
             
-            # Process frame with confidence scores
-            eye_state, eye_conf = detect_eye_state_advanced(frame, avg_brightness)
-            posture, posture_conf = detect_posture_advanced(frame)
+            if posture_conf < 0.3:
+                posture = last_valid_posture
+            else:
+                last_valid_posture = posture
             
-            # Add to temporal buffers
-            eye_buffer.append(eye_state)
-            posture_buffer.append(posture)
+            smoother.add_posture(posture)
             
-            if len(eye_buffer) > BUFFER_SIZE:
-                eye_buffer.pop(0)
-            if len(posture_buffer) > BUFFER_SIZE:
-                posture_buffer.pop(0)
-            
-            # IMPROVED: Weighted voting for temporal consistency
-            final_eye = weighted_majority(eye_buffer, temporal_weights)
-            final_posture = weighted_majority(posture_buffer, temporal_weights)
+            final_posture = smoother.get_smoothed_posture()
             
             labels_per_frame[str(frame_idx)] = {
-                "eye_state": final_eye,
+                "eye_state": eye_state,
                 "posture": final_posture
             }
             
-            prev_label = labels_per_frame[str(frame_idx)]
-            
-        except Exception as e:
-            print(f"Frame {frame_idx} error: {str(e)}")
-            # Use previous frame (more graceful degradation)
-            labels_per_frame[str(frame_idx)] = prev_label.copy()
+        except Exception:
+            labels_per_frame[str(frame_idx)] = {
+                "eye_state": last_valid_eye,
+                "posture": last_valid_posture
+            }
         
         frame_idx += 1
         
-        # Progress indicator
-        if frame_idx % 30 == 0 or frame_idx == total_frames:
+        if frame_idx % 50 == 0 or frame_idx == total_frames:
             progress = int(frame_idx / total_frames * 100)
-            print(f"{frame_idx}/{total_frames} ({progress}%)")
+            print(f"Progress: {frame_idx}/{total_frames} ({progress}%)")
     
     cap.release()
     
-    print(f"\n{'='*60}")
-    print(f"Complete: {frame_idx} frames annotated")
-    print(f"{'='*60}\n")
+    print(f"\nProcessing complete: {frame_idx} frames processed\n")
     
     return {
         "video_filename": os.path.basename(video_path),
@@ -439,15 +276,15 @@ def process_video(video_path: str) -> Dict:
 
 @app.post("/annotate")
 async def annotate_video(file: UploadFile = File(...)):
-    """
-    Annotate video with eye state and posture labels.
+    allowed_extensions = (
+        '.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', 
+        '.webm', '.m4v', '.mpeg', '.mpg', '.3gp', '.ogv'
+    )
     
-    Accepts .mp4 or .avi video files and returns frame-by-frame analysis.
-    """
-    if not file.filename.lower().endswith(('.mp4', '.avi')):
+    if not file.filename.lower().endswith(allowed_extensions):
         raise HTTPException(
             status_code=400,
-            detail="Only .mp4 and .avi formats supported"
+            detail=f"Unsupported format. Allowed: {', '.join(allowed_extensions)}"
         )
     
     with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp_file:
@@ -456,8 +293,7 @@ async def annotate_video(file: UploadFile = File(...)):
         tmp_file_path = tmp_file.name
     
     try:
-        file_size_mb = len(content) / (1024 * 1024)
-        print(f"\n Received: {file.filename} ({file_size_mb:.2f} MB)")
+        print(f"\nReceived: {file.filename} ({len(content) / (1024 * 1024):.2f} MB)")
         
         result = process_video(tmp_file_path)
         result["video_filename"] = file.filename
@@ -475,14 +311,11 @@ async def annotate_video(file: UploadFile = File(...)):
 async def root():
     return {
         "service": "AI Video Annotator",
-        "version": "1.0.0",
+        "version": "13.0.0",
         "status": "running",
-        "models": "MediaPipe Face Mesh + OpenCV",
-        "improvements": "Enhanced thresholds, weighted temporal smoothing, adaptive lighting",
         "endpoints": {
             "annotate": "/annotate (POST)",
-            "health": "/health (GET)",
-            "docs": "/docs (GET)"
+            "health": "/health (GET)"
         }
     }
 
@@ -491,22 +324,15 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "mediapipe": "loaded",
-        "opencv": "loaded"
+        "mediapipe_face": "loaded",
+        "mediapipe_pose": "loaded"
     }
 
 
 if __name__ == "__main__":
     print("\n" + "="*60)
-    print("AI Video Annotator Service - Enhanced Accuracy")
+    print("AI Video Annotator Service v13.0 - HUNCHED DEFAULT")
     print("="*60)
-    print("Using MediaPipe Face Mesh + OpenCV")
-    print("Improvements:")
-    print("   - Wider EAR thresholds (0.18/0.25)")
-    print("   - Raised posture detection thresholds")
-    print("   - Weighted temporal smoothing")
-    print("   - Adaptive lighting compensation")
-    print("   - Confidence-based decision fusion")
     print("Server: http://localhost:8000")
     print("API Docs: http://localhost:8000/docs")
     print("="*60 + "\n")
